@@ -1,0 +1,435 @@
+name: 'Build NEXUS RACING Android APK (one ZIP in a GitHub Release)'
+
+# ======================================================================================================================
+# HOW THIS WORKS (nothing has to be edited inside this file)
+#
+#   1. In your repository create a GitHub Release with an EXACT tag (for example nexus-h2r-v1)
+#      and attach ONE file to it:  NEXUS_RACING-FINAL.zip
+#
+#   2. Actions tab -> "Build NEXUS RACING Android APK ..." -> Run workflow -> type that exact tag
+#      (publishing the Release also starts the build, with that Release's own tag).
+#
+#   There is NO fallback: an empty tag, the old tag "v.10", "latest", a tag that does not exist or a ZIP that is incomplete FAILS the run
+#   with a clear message. The workflow never silently uses another Release.
+#
+# Design checks: every screen uses the blue / gold / purple card tones, the home screen has the LOOK button and the LOOK sliders update live.
+# The Kotlin package folder is found automatically, so renaming the package id never breaks this workflow.
+# Multiplayer server address (optional): repository variable NEXUS_BACKEND_URL (wss://...). The backend is not touched by this workflow.
+# Another ZIP name (optional): repository variable BUNDLE_ZIP_NAME.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Exact Release tag that holds the ZIP (required), for example nexus-h2r-v1'
+        required: true
+        type: string
+  release:
+    types: [published]
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+env:
+  BUNDLE_ZIP_NAME: ${{ vars.BUNDLE_ZIP_NAME || 'NEXUS_RACING-FINAL.zip' }}
+  RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+  NEXUS_BACKEND_URL: ${{ vars.NEXUS_BACKEND_URL || '' }}
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+
+    steps:
+
+      # ---------------------------------------------------------------- 1. the Release tag must be explicit and valid
+
+      - name: Check the Release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$(echo "${RELEASE_TAG:-}" | tr -d '[:space:]')"
+          if [ -z "$TAG" ]; then
+            echo "::error::No Release tag given. Run the workflow again and type the exact tag (for example nexus-h2r-v1)."
+            exit 1
+          fi
+          case "$TAG" in
+            latest|LATEST|Latest) echo "::error::The tag 'latest' is not accepted. Use the exact tag, for example nexus-h2r-v1."; exit 1 ;;
+            v.10) echo "::error::The old tag 'v.10' is not accepted: it holds the old Countryside-only package. Use the exact tag of your newest Release."; exit 1 ;;
+          esac
+          if ! echo "$TAG" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::The tag '$TAG' contains characters that are not allowed."
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Release tag : $TAG"
+          echo "ZIP         : $BUNDLE_ZIP_NAME"
+
+      # ---------------------------------------------------------------- 2. download exactly that Release's bundle
+
+      - name: Download the ZIP from the Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf bundle_dl && mkdir -p bundle_dl
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release '$RELEASE_TAG' does not exist in $GITHUB_REPOSITORY (or it is still a draft). Create and publish it first."
+            exit 1
+          fi
+          if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$BUNDLE_ZIP_NAME" --dir bundle_dl --clobber; then
+            echo "::error::Release '$RELEASE_TAG' has no asset named $BUNDLE_ZIP_NAME. Attach the ZIP to that Release."
+            echo "Assets that the Release does have:"
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' || true
+            exit 1
+          fi
+          B="bundle_dl/$BUNDLE_ZIP_NAME"
+          SIZE=$(stat -c %s "$B")
+          echo "Download URL : https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$BUNDLE_ZIP_NAME"
+          echo "Size         : $SIZE bytes"
+          if [ "$SIZE" -lt 1000000 ]; then echo "::error::$BUNDLE_ZIP_NAME is only $SIZE bytes: that is not the complete project ZIP."; exit 1; fi
+          unzip -tq "$B" > /dev/null || { echo "::error::$BUNDLE_ZIP_NAME is not a valid ZIP (broken upload?)."; exit 1; }
+          echo "BUNDLE_PATH=$GITHUB_WORKSPACE/$B" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- 3. extract the one ZIP (code + all assets + both maps are already inside)
+
+      - name: Extract the project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project && mkdir -p project
+          unzip -q -o "$BUNDLE_PATH" -d project -x '__MACOSX/*' || true
+          ROOT=""
+          for dp in $(find project -maxdepth 3 -type d); do
+            if [ -f "$dp/settings.gradle.kts" ]; then ROOT="$dp"; break; fi
+          done
+          if [ -z "$ROOT" ]; then
+            echo "::error::$BUNDLE_ZIP_NAME has no settings.gradle.kts: this is not the complete NEXUS RACING project ZIP."
+            exit 1
+          fi
+          A="$ROOT/app/src/main/assets"
+          for d in "$A/map/countryside" "$A/map/nightcity" "$A/npc" "$A/models" "$A/config"; do
+            [ -d "$d" ] || { echo "::error::Missing folder inside the ZIP: ${d#$ROOT/}"; exit 1; }
+          done
+          echo "Android project root: $ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Check the Android project files and the map registration in the code
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in settings.gradle.kts build.gradle.kts app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            [ -f "$PROJECT_DIR/$f" ] || { echo "::error::$PROJECT_DIR/$f is missing"; exit 1; }
+          done
+          CFG="$(find "$PROJECT_DIR/app/src/main/kotlin" -path '*/data/Config.kt' | head -n 1)"
+          if [ -z "$CFG" ]; then echo "::error::data/Config.kt was not found under app/src/main/kotlin."; exit 1; fi
+          K="$(dirname "$(dirname "$CFG")")"
+          echo "Kotlin package folder: ${K#$PROJECT_DIR/}"
+          grep -q 'const val COUNTRY = 6' "$K/data/Config.kt"   || { echo "::error::Config.kt: Countryside (COUNTRY = 6) is not registered."; exit 1; }
+          grep -q 'const val NIGHTCITY = 7' "$K/data/Config.kt" || { echo "::error::Config.kt: NEXUS NIGHT CITY (NIGHTCITY = 7) is not registered."; exit 1; }
+          grep -q '"NEXUS NIGHT CITY"' "$K/data/Config.kt"      || { echo "::error::Config.kt: the NEXUS NIGHT CITY map entry is missing."; exit 1; }
+          [ -f "$K/graphics/NightCity.kt" ] || { echo "::error::graphics/NightCity.kt is missing."; exit 1; }
+          [ -f "$K/ui/NightCityCard.kt" ]   || { echo "::error::ui/NightCityCard.kt (map card with the NEW MAP badge) is missing."; exit 1; }
+          [ -f "$K/ui/CountrysideCard.kt" ] || { echo "::error::ui/CountrysideCard.kt is missing (Countryside must be kept)."; exit 1; }
+          grep -q 'NightCityCard' "$K/ui/MapChooser.kt"         || { echo "::error::MapChooser.kt does not use NightCityCard."; exit 1; }
+          grep -q 'NightCity.preload' "$K/GameActivity.kt"      || { echo "::error::GameActivity.kt does not preload the Night City models."; exit 1; }
+          grep -q 'env.kind == 7' "$K/graphics/SceneDrawer.kt"  || { echo "::error::SceneDrawer.kt has no scenery for map kind 7."; exit 1; }
+          grep -q 'itemCountry' "$K/graphics/SceneDrawer.kt"    || { echo "::error::SceneDrawer.kt lost the Countryside scenery."; exit 1; }
+          [ -f "$K/ui/LyricsView.kt" ]      || { echo "::error::ui/LyricsView.kt (lyrics over the game) is missing."; exit 1; }
+          [ -f "$K/ui/GradeUi.kt" ]         || { echo "::error::ui/GradeUi.kt (colour grading panel) is missing."; exit 1; }
+          [ -f "$K/graphics/GradeKit.kt" ]  || { echo "::error::graphics/GradeKit.kt (colour grading shader) is missing."; exit 1; }
+          [ -f "$K/graphics/Grade.kt" ]     || { echo "::error::graphics/Grade.kt is missing."; exit 1; }
+          [ -f "$K/graphics/GradeCode.kt" ] || { echo "::error::graphics/GradeCode.kt (look codes) is missing."; exit 1; }
+          grep -q 'askCode' "$K/ui/GradeUi.kt"                || { echo "::error::GradeUi.kt has no 'enter a look code' option."; exit 1; }
+          grep -q 'grade?.apply' "$K/graphics/RaceRenderer.kt" || { echo "::error::RaceRenderer.kt does not apply the colour grading pass."; exit 1; }
+          [ -f "$K/ui/HomeScreen.kt" ]      || { echo "::error::ui/HomeScreen.kt (neon home screen) is missing."; exit 1; }
+          [ -f "$K/ui/NeonStyle.kt" ]       || { echo "::error::ui/NeonStyle.kt (neon card style) is missing."; exit 1; }
+          [ -f "$K/ui/LookScreen.kt" ]      || { echo "::error::ui/LookScreen.kt (colour grading on the home screen) is missing."; exit 1; }
+          grep -q 'LookScreen' "$K/ui/HomeScreen.kt"           || { echo "::error::Screens1.kt has no LOOK button on the home screen."; exit 1; }
+          grep -q 'enum class Tone' "$K/ui/NeonStyle.kt"        || { echo "::error::NeonStyle.kt has no Tone colour families (blue / gold / purple)."; exit 1; }
+          grep -q 'class StreakDrawable' "$K/ui/NeonStyle.kt"   || { echo "::error::NeonStyle.kt has no StreakDrawable (light beams behind every screen)."; exit 1; }
+          grep -q 'Tone.PURPLE' "$K/ui/HomeScreen.kt"           || { echo "::error::HomeScreen.kt: MULTIPLAYER must use the purple tone."; exit 1; }
+          grep -q 'Tone.GOLD' "$K/ui/HomeScreen.kt"             || { echo "::error::HomeScreen.kt: GARAGE and DAILY REWARDS must use the gold tone."; exit 1; }
+          grep -q 'lookBtn' "$K/ui/HomeScreen.kt"               || { echo "::error::HomeScreen.kt has no LOOK (colour grading) button."; exit 1; }
+          [ "$(grep -c 'previewMatrix(Grade.live)' "$K/ui/LookScreen.kt")" -ge 2 ] || { echo "::error::LookScreen.kt: the sliders do not update the preview picture live."; exit 1; }
+          grep -q 'onChange' "$K/ui/GradeUi.kt"                 || { echo "::error::GradeUi.kt has no live onChange callback for the sliders."; exit 1; }
+          grep -q 'class BikeSilhouetteDrawable' "$K/ui/NeonStyle.kt" || { echo "::error::NeonStyle.kt has no BikeSilhouetteDrawable (bike outline in the GARAGE card)."; exit 1; }
+          grep -q 'BikeSilhouetteDrawable' "$K/ui/HomeScreen.kt"      || { echo "::error::HomeScreen.kt does not draw the bike outline in the GARAGE card."; exit 1; }
+          grep -q 'private val skew' "$K/ui/NeonStyle.kt"             || { echo "::error::NeonStyle.kt: GlassDrawable has no slanted (skew) shape for PLAY and the main buttons."; exit 1; }
+          grep -q 'private val glint' "$K/ui/NeonStyle.kt"            || { echo "::error::NeonStyle.kt: GlassDrawable has no corner light (slash / glint)."; exit 1; }
+          grep -q 'android:alertDialogTheme' "$PROJECT_DIR/app/src/main/res/values/styles.xml" || { echo "::error::styles.xml has no dark dialog theme (alertDialogTheme)."; exit 1; }
+          [ -f "$PROJECT_DIR/app/src/main/res/drawable/dialog_bg.xml" ] || { echo "::error::res/drawable/dialog_bg.xml (dialog panel) is missing."; exit 1; }
+          grep -q 'addView(view, 1,' "$K/ui/LyricsView.kt"     || { echo "::error::LyricsView must sit BELOW the HUD (index 1), otherwise it hides the buttons."; exit 1; }
+          [ -f "$K/audio/SampleBank.kt" ]   || { echo "::error::audio/SampleBank.kt (real H2R engine sound) is missing."; exit 1; }
+          grep -q 'useSamples' "$K/GameActivity.kt"            || { echo "::error::GameActivity.kt does not switch the H2R to the recorded engine."; exit 1; }
+          grep -q 'openLyricsPicker' "$K/ui/MusicPicUi.kt"      || { echo "::error::MusicPicUi.kt has no lyrics-video import button."; exit 1; }
+          grep -q 'REQ_LYR' "$K/MainActivity.kt"               || { echo "::error::MainActivity.kt does not forward the lyrics-video picker result."; exit 1; }
+          grep -q 'LyricsLayer' "$K/GameActivity.kt"           || { echo "::error::GameActivity.kt does not use the lyrics layer."; exit 1; }
+          grep -q '"m4a"' "$PROJECT_DIR/app/build.gradle.kts"  || { echo "::error::app/build.gradle.kts: m4a / mp4 must be in noCompress (songs are read straight from the APK)."; exit 1; }
+          echo "Project folder: $PROJECT_DIR"
+          if [ -n "$NEXUS_BACKEND_URL" ]; then
+            case "$NEXUS_BACKEND_URL" in
+              wss://*|ws://*) echo "Multiplayer server (repository variable): $NEXUS_BACKEND_URL" ;;
+              *) echo "::error::The repository variable NEXUS_BACKEND_URL must start with wss:// (for example wss://my-backend.onrender.com/ws). Current value: $NEXUS_BACKEND_URL"; exit 1 ;;
+            esac
+          else
+            echo "NEXUS_BACKEND_URL variable not set: the address from gradle.properties / MpConfig.kt is used."
+            grep -n '^NEXUS_BACKEND_URL' "$PROJECT_DIR/gradle.properties" || true
+          fi
+
+      # ---------------------------------------------------------------- 5. assets are checked from the project's OWN config files
+
+      - name: Verify vehicles, NPC registry, audio and BOTH maps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR/app/src/main/assets" <<'PY'
+          import json, os, struct, sys
+          a = sys.argv[1]
+          errors = 0
+          def err(m):
+              global errors; errors += 1; print("::error::" + m)
+          def glb(p, what):
+              f = os.path.join(a, p)
+              if not os.path.isfile(f): err("Missing %s %s (is a ZIP part missing?)" % (what, p)); return
+              with open(f, "rb") as h: raw = h.read()
+              if raw[:4] != b"glTF": err("%s is not a valid GLB" % p); return
+              print("ok  %-30s %7.2f MB  (%s)" % (p, os.path.getsize(f) / 1e6, what))
+          bikes = json.load(open(a + "/config/bikes.json"))
+          for b in bikes:
+              g = (b.get("model") or {}).get("glb")
+              if g: glb(g, "bike " + b["id"])
+          ids = [b["id"] for b in bikes]
+          for b in bikes:
+              f = os.path.join(a, "ui", "bike_%s.png" % b["id"])
+              if not os.path.isfile(f): err("Missing speedometer icon ui/bike_%s.png" % b["id"])
+              elif open(f, "rb").read(4) != b"\x89PNG": err("ui/bike_%s.png is not a PNG" % b["id"])
+              if not (b.get("custom") or {}).get("paint"): err("bike %s has no custom.paint materials in config/bikes.json" % b["id"])
+          # the new Kawasaki Ninja H2R is the dearest bike and is the LAST entry; the old "H2R" model is now the ZX-10R
+          if ids[-1] != "kawasaki_h2r": err("kawasaki_h2r (Kawasaki Ninja H2R) must be the LAST bike in config/bikes.json (found %s)" % ids[-1])
+          if "kawasaki_zx10r" not in ids: err("bike kawasaki_zx10r (the former H2R model) is missing in config/bikes.json")
+          h2 = [b for b in bikes if b["id"] == "kawasaki_h2r"]
+          if h2:
+              if h2[0].get("topSpeedKmh") != 420 or (h2[0].get("phys") or {}).get("speedCapKmh") != 420: err("kawasaki_h2r (Kawasaki Ninja H2R) top speed must be 420 km/h")
+              if abs(((h2[0].get("phys") or {}).get("nitroTopMul") or 0) * 420 - 450) > 1: err("kawasaki_h2r nitro top speed must be 450 km/h")
+              if not h2[0].get("fx"): err("kawasaki_h2r has no fx block (flames / brake light / number plate)")
+          for r in json.load(open(a + "/config/riders.json")): glb(r["glb"], "rider")
+          npc = json.load(open(a + "/config/npc_vehicles.json"))
+          if len(npc) < 10: err("config/npc_vehicles.json lists only %d NPC vehicles" % len(npc))
+          for n in npc: glb(n["glb"], "npc " + n["id"])
+          if not os.path.isfile(os.path.join(a, "fonts", "hud_slab.ttf")): err("Missing fonts/hud_slab.ttf (HUD font)")
+          for s in ["crash.mp3", "nitro_loop.mp3", "bike_horn.mp3", "npc_car_horn.mp3"]:
+              f = os.path.join(a, "audio", s)
+              if not os.path.isfile(f): err("Missing audio/" + s); continue
+              h = open(f, "rb").read(3)
+              if not (h == b"ID3" or (h[0] == 0xFF and (h[1] & 0xE0) == 0xE0)): err("audio/%s is not an MP3" % s)
+
+          # built-in songs: audio + packed-alpha lyric video (960x1080: colour on top, matte below) + round picture
+          for slug in ["maan_meera", "paro", "ride_it", "gata_only", "love_niwati"]:
+              m = os.path.join(a, "music")
+              sa, sv, sp = [os.path.join(m, slug + e) for e in (".m4a", ".lyr.mp4", ".png")]
+              for f in (sa, sv, sp):
+                  if not os.path.isfile(f): err("Missing music/%s" % os.path.basename(f))
+              if os.path.isfile(sa) and open(sa, "rb").read(12)[4:8] != b"ftyp": err("music/%s.m4a is not an MP4/M4A audio file" % slug)
+              if os.path.isfile(sv):
+                  hd = open(sv, "rb").read(12)[4:8]
+                  if hd != b"ftyp": err("music/%s.lyr.mp4 is not an MP4 video" % slug)
+                  if os.path.getsize(sv) < 500000: err("music/%s.lyr.mp4 is too small (broken upload?)" % slug)
+              if os.path.isfile(sp) and open(sp, "rb").read(4) != b"\x89PNG": err("music/%s.png is not a PNG" % slug)
+          print("music: 5 built-in songs + lyric videos + round pictures checked")
+          for e in ["h2r_loop", "h2r_release", "h2r_idle", "h2r_shift"]:
+              f = os.path.join(a, "audio", "engine", e + ".wav")
+              if not os.path.isfile(f): err("Missing audio/engine/%s.wav (real Ninja H2R engine recording)" % e)
+              elif open(f, "rb").read(4) != b"RIFF": err("audio/engine/%s.wav is not a WAV file" % e)
+
+          SUPPORTED_REQ = {"KHR_materials_emissive_strength", "KHR_mesh_quantization"}
+          def check_map(cfgname, want_id, want_dir, min_models):
+              cm = json.load(open(os.path.join(a, "config", cfgname)))
+              m = cm["map"]
+              if m["id"] != want_id: err("%s: map id is %s, expected %d" % (cfgname, m["id"], want_id))
+              if m["dir"] != want_dir: err("%s: map dir is %s, expected %s" % (cfgname, m["dir"], want_dir))
+              if not os.path.isfile(os.path.join(a, m["preview"])): err("Missing map preview image " + m["preview"])
+              elif open(os.path.join(a, m["preview"]), "rb").read(2) != b"\xff\xd8": err(m["preview"] + " is not a JPEG")
+              files = []; tot = 0
+              if len(cm["models"]) < min_models: err("%s lists only %d models (expected at least %d)" % (cfgname, len(cm["models"]), min_models))
+              for mm in cm["models"]:
+                  p = mm["file"]; files.append(p)
+                  if not p.startswith(want_dir): err("%s: %s is outside %s (maps must stay separate)" % (cfgname, p, want_dir))
+                  f = os.path.join(a, p)
+                  if not os.path.isfile(f): err("Missing map model %s (is the map ZIP complete?)" % p); continue
+                  raw = open(f, "rb").read(); tot += len(raw)
+                  if raw[:4] != b"glTF": err("%s is not a valid GLB" % p); continue
+                  ver, total = struct.unpack("<II", raw[4:12])
+                  if ver != 2 or total != len(raw): err("%s: GLB header / length mismatch (damaged download?)" % p); continue
+                  jl, jt = struct.unpack("<I4s", raw[12:20])
+                  try: j = json.loads(raw[20:20 + jl])
+                  except Exception as e: err("%s: JSON chunk unreadable: %s" % (p, e)); continue
+                  for e in j.get("extensionsRequired", []):
+                      if e not in SUPPORTED_REQ: err("%s requires the unsupported extension %s" % (p, e))
+                  if any("uri" in b for b in j.get("buffers", [])): err("%s uses an external buffer" % p)
+                  for im in j.get("images", []):
+                      if "bufferView" not in im: err("%s: a texture is not embedded" % p); break
+                  if not j.get("meshes"): err("%s has no mesh" % p)
+                  if want_id == 7 and os.path.basename(p).startswith("billboard_nexus"):
+                      if not any("emissiveTexture" in mt for mt in j.get("materials", [])): err("%s has no emissive NEXUS RACING face texture" % p)
+              print("%s: %d models checked, %.1f MB" % (m["name"], len(cm["models"]), tot / 1e6))
+              return cm, files
+          cm6, f6 = check_map("countryside_map.json", 6, "map/countryside/", 20)
+          cm7, f7 = check_map("nightcity_map.json", 7, "map/nightcity/", 20)
+          if set(f6) & set(f7): err("The two maps share model files: %s" % sorted(set(f6) & set(f7)))
+          if cm6["map"]["id"] == cm7["map"]["id"]: err("The two maps have the same id")
+
+          env = open(os.environ["GITHUB_ENV"], "a")
+          lst = sorted({(b.get("model") or {}).get("glb") for b in bikes if (b.get("model") or {}).get("glb")}
+                       | {r["glb"] for r in json.load(open(a + "/config/riders.json"))} | {n["glb"] for n in npc}
+                       | {"ui/bike_%s.png" % b["id"] for b in bikes}
+                       | {"fonts/hud_slab.ttf", "audio/crash.mp3", "audio/nitro_loop.mp3", "audio/bike_horn.mp3", "audio/npc_car_horn.mp3",
+                          "config/bikes.json", "config/npc_vehicles.json", "config/countryside_map.json", "config/nightcity_map.json",
+                          cm6["map"]["preview"], cm7["map"]["preview"]}
+                       | {"audio/engine/%s.wav" % e for e in ["h2r_loop", "h2r_release", "h2r_idle", "h2r_shift"]}
+                       | {"music/%s%s" % (sl, e) for sl in ["maan_meera", "paro", "ride_it", "gata_only", "love_niwati"] for e in (".m4a", ".lyr.mp4", ".png")}
+                       | set(f6) | set(f7))
+          env.write("APK_ASSETS=%s\n" % ",".join(lst))
+          env.write("COUNTRY_MODELS=%d\n" % len(f6))
+          env.write("NIGHT_MODELS=%d\n" % len(f7))
+          sys.exit(1 if errors else 0)
+          PY
+
+      # ---------------------------------------------------------------- 6. tool versions follow the project's real Android Gradle Plugin
+
+      - name: Read project build requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          AGP=$(grep -oE 'com\.android\.application"\)?[^"]*version "[0-9]+\.[0-9]+(\.[0-9]+)?' "$PROJECT_DIR/build.gradle.kts" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?$' | head -n 1 || true)
+          COMPILE=$(grep -oE 'compileSdk *= *[0-9]+' "$PROJECT_DIR/app/build.gradle.kts" | grep -oE '[0-9]+$' | head -n 1 || true)
+          if [ -z "$AGP" ] || [ -z "$COMPILE" ]; then
+            echo "::error::Could not read the Android Gradle Plugin version ('$AGP') or compileSdk ('$COMPILE') from the project."
+            exit 1
+          fi
+          MM=$(echo "$AGP" | cut -d. -f1,2)
+          case "$MM" in
+            8.0)  GRADLE=8.0.2;  BT=33.0.1 ;;
+            8.1)  GRADLE=8.3;    BT=33.0.1 ;;
+            8.2)  GRADLE=8.4;    BT=34.0.0 ;;
+            8.3)  GRADLE=8.7;    BT=34.0.0 ;;
+            8.4)  GRADLE=8.7;    BT=34.0.0 ;;
+            8.5)  GRADLE=8.7;    BT=34.0.0 ;;
+            8.6)  GRADLE=8.7;    BT=34.0.0 ;;
+            8.7)  GRADLE=8.9;    BT=35.0.0 ;;
+            8.8)  GRADLE=8.10.2; BT=35.0.0 ;;
+            8.9)  GRADLE=8.11.1; BT=35.0.0 ;;
+            8.10) GRADLE=8.11.1; BT=35.0.0 ;;
+            8.11) GRADLE=8.13;   BT=35.0.0 ;;
+            *)
+              echo "::error::Android Gradle Plugin $AGP is not in this workflow's compatibility table. Add it to the 'case' list."
+              exit 1 ;;
+          esac
+          echo "AGP $AGP -> Gradle $GRADLE, compileSdk $COMPILE, build-tools $BT (Java 17)"
+          echo "GRADLE_VERSION=$GRADLE" >> "$GITHUB_ENV"
+          echo "COMPILE_SDK=$COMPILE" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS=$BT" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            SDKM=$(find "$SDK/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | head -n 1 || true)
+          fi
+          if [ -z "$SDKM" ] || [ ! -x "$SDKM" ]; then
+            echo "::error::Android SDK command-line tools (sdkmanager) were not found under $SDK."
+            exit 1
+          fi
+          echo "SDK: $SDK"
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK" "platforms;android-${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" > sdkmanager.log 2>&1 || { cat sdkmanager.log; echo "::error::sdkmanager could not install platform ${COMPILE_SDK} / build-tools ${BUILD_TOOLS}."; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          ARGS=()
+          if [ -n "${NEXUS_BACKEND_URL:-}" ]; then ARGS+=("-PNEXUS_BACKEND_URL=${NEXUS_BACKEND_URL}"); fi
+          gradle :app:assembleDebug ${ARGS[@]+"${ARGS[@]}"} --stacktrace --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      # ---------------------------------------------------------------- 7. the APK must really contain every verified asset and the new map code
+
+      - name: Verify APK exists and contains the assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::Build finished but $APK was not created."
+            exit 1
+          fi
+          ls -l "$APK"
+          unzip -l "$APK" | awk '{print $4}' > apk-files.txt
+          IFS=',' read -ra LIST <<< "$APK_ASSETS"
+          MISS=0
+          for A in "${LIST[@]}"; do
+            if ! grep -qx "assets/$A" apk-files.txt; then echo "::error::The APK does not contain assets/$A."; MISS=1; fi
+          done
+          [ "$MISS" = 0 ] || exit 1
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'NightCityCard'; then echo "::error::The APK code does not contain the NEXUS NIGHT CITY map card."; exit 1; fi
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'CountrysideCard'; then echo "::error::The APK code lost the NEXUS COUNTRYSIDE map card."; exit 1; fi
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'LyricsLayer'; then echo "::error::The APK code does not contain the lyrics layer."; exit 1; fi
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'GradeCode'; then echo "::error::The APK code does not contain the look codes."; exit 1; fi
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'StreakDrawable'; then echo "::error::The APK code does not contain the new screen design (StreakDrawable)."; exit 1; fi
+          if ! unzip -p "$APK" 'classes*.dex' | grep -aq 'GradeKit'; then echo "::error::The APK code does not contain the colour grading pass."; exit 1; fi
+          echo "APK contains all ${#LIST[@]} checked assets (bikes, riders, NPC vehicles, sounds, ${COUNTRY_MODELS} NEXUS COUNTRYSIDE models, ${NIGHT_MODELS} NEXUS NIGHT CITY models) and both map cards, the 5 built-in songs with lyric videos, the lyrics layer and colour grading."
+          cp "$APK" "$GITHUB_WORKSPACE/NEXUS_RACING-debug.apk"
+
+      - name: Show build error summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Build error summary"
+            echo '```'
+            if [ -f build.log ]; then
+              grep -n -B2 -A25 "What went wrong" build.log | head -80 || true
+              echo "--- lines mentioning errors ---"
+              grep -n -E "^e: |error:|Execution failed|FAILED|Could not|ERROR" build.log | head -40 || true
+            else
+              echo "No build.log: the failure happened before the Gradle build step (see the failed step above)."
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS_RACING-debug-apk
+          path: NEXUS_RACING-debug.apk
+          if-no-files-found: error
